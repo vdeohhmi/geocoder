@@ -1,3 +1,5 @@
 Flask==2.3.2
 geopy==2.4.1
+pandas>=2.0
+openpyxl
 gunicorn==20.1.0
