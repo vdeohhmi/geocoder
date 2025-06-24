@@ -6,103 +6,80 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 
-# Set page layout
 st.set_page_config(page_title="Institute Geolocation Finder", layout="wide")
 st.title("🏫 Institute Geolocation Finder")
 
-# Geolocator setup
 geolocator = Nominatim(user_agent="GeoLocatorApp", timeout=10)
 
-# Cache for repeat lookups
 @st.cache_data(show_spinner=False)
 def cached_geocode(name):
     try:
-        location = geolocator.geocode(name)
-        if location:
-            return location.latitude, location.longitude
-        else:
-            return "Not found", "Not found"
+        loc = geolocator.geocode(name)
+        if loc:
+            return loc.latitude, loc.longitude
+        return "Not found", "Not found"
     except GeocoderTimedOut:
         time.sleep(1)
         return cached_geocode(name)
-    except Exception:
+    except:
         return "Not found", "Not found"
 
-# Geocode in parallel using threads
-def parallel_geocode(institute_list, max_workers=15):
+def parallel_geocode(names, max_workers=15):
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(cached_geocode, name): name for name in institute_list}
-        for i, future in enumerate(as_completed(futures)):
+        futures = {executor.submit(cached_geocode, n): n for n in names}
+        for i, fut in enumerate(as_completed(futures)):
             try:
-                result = future.result()
-            except Exception:
-                result = ("Not found", "Not found")
-            results.append(result)
-            st.progress((i + 1) / len(institute_list), text=f"Processing {i+1}/{len(institute_list)}")
+                results.append(fut.result())
+            except:
+                results.append(("Not found", "Not found"))
+            st.progress((i+1)/len(names), text=f"Processing {i+1}/{len(names)}")
     return results
 
-# Sidebar mode selection
-st.sidebar.header("Choose Input Method")
 mode = st.sidebar.radio("Select input type:", ["Manual entry", "Upload file (.csv or .xlsx)"])
 
-# === Manual Input Mode ===
 if mode == "Manual entry":
     name = st.text_input("Enter institute name", placeholder="e.g., MIT or IISc Bangalore")
-    if st.button("Get Coordinates"):
-        if name.strip():
-            lat, lon = cached_geocode(name)
-            if lat == "Not found":
-                st.error("Could not find coordinates.")
-            else:
-                st.success("Coordinates found!")
-                st.write(f"📍 Latitude: **{lat}**, Longitude: **{lon}**")
-                st.map(pd.DataFrame({"lat": [lat], "lon": [lon]}))
+    if st.button("Get Coordinates") and name.strip():
+        lat, lon = cached_geocode(name)
+        if lat == "Not found":
+            st.error("Could not find coordinates.")
         else:
-            st.warning("Please enter a valid name.")
-
-# === File Upload Mode ===
+            st.success("Coordinates found!")
+            st.write(f"📍 Latitude: **{lat}**, Longitude: **{lon}**")
+            st.map(pd.DataFrame({"lat": [lat], "lon": [lon]}))
+    elif st.button("Get Coordinates"):
+        st.warning("Please enter a valid name.")
 else:
-    uploaded_file = st.file_uploader("Upload CSV or Excel with a column named 'Institute'", type=["csv", "xlsx"])
-
-    if uploaded_file:
+    uploaded = st.file_uploader("Upload CSV or Excel with a column named 'Institute'", type=["csv", "xlsx"])
+    if uploaded:
         try:
-            if uploaded_file.name.endswith(".csv"):
-                df = pd.read_csv(uploaded_file)
-                file_type = "csv"
-            else:
-                df = pd.read_excel(uploaded_file)
-                file_type = "xlsx"
-
+            df = pd.read_csv(uploaded) if uploaded.name.endswith(".csv") else pd.read_excel(uploaded)
             if "Institute" not in df.columns:
                 st.error("❌ File must contain a column named 'Institute'.")
             else:
                 st.info("⏳ Geocoding all institutes. Please wait...")
-
                 names = df["Institute"].astype(str).tolist()
-                results = parallel_geocode(names)
-
-                latitudes, longitudes = zip(*results)
-                df["Latitude"] = latitudes
-                df["Longitude"] = longitudes
-
+                coords = parallel_geocode(names)
+                df["Latitude"], df["Longitude"] = zip(*coords)
                 st.success("✅ All geocoding completed.")
                 st.dataframe(df)
-
-                # Show map for valid coordinates
-                map_df = df[(df["Latitude"] != "Not found") & (df["Longitude"] != "Not found")]
-                if not map_df.empty:
-                    st.map(map_df.rename(columns={"Latitude": "lat", "Longitude": "lon"}))
-
-                # Download options
-                if file_type == "csv":
-                    csv_data = df.to_csv(index=False)
-                    st.download_button("📤 Download as CSV", csv_data, file_name="institutes_with_coords.csv", mime="text/csv")
+                valid = df[(df["Latitude"]!="Not found")&(df["Longitude"]!="Not found")]
+                if not valid.empty:
+                    st.map(valid.rename(columns={"Latitude":"lat","Longitude":"lon"}))
+                if uploaded.name.endswith(".csv"):
+                    st.download_button("📤 Download CSV", df.to_csv(index=False), "institutes_with_coords.csv", "text/csv")
                 else:
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        df.to_excel(writer, index=False, sheet_name="Geocoded Data")
-                    st.download_button("📤 Download as Excel", output.getvalue(), file_name="institutes_with_coords.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                        df.to_excel(w, index=False, sheet_name="Geocoded Data")
+                    st.download_button("📤 Download Excel", buf.getvalue(), "institutes_with_coords.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         except Exception as e:
             st.error(f"❌ Failed to process file: {e}")
+
+
+
+
+
+
+
