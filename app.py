@@ -1,24 +1,41 @@
-import sys
+import streamlit as st
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 
-def geocode(name):
-    geolocator = Nominatim(user_agent="institute_geocoder", timeout=10)
+@st.cache_data(ttl=24*3600)
+def get_location(query: str):
+    """
+    Geocode the given query string and return a (latitude, longitude) tuple,
+    or None if not found.
+    """
+    geolocator = Nominatim(user_agent="institute_locator")
     try:
-        loc = geolocator.geocode(name)
-        if loc:
-            return loc.latitude, loc.longitude
+        loc = geolocator.geocode(query)
     except GeocoderTimedOut:
-        return geocode(name)
-    return None, None
+        return None
+    if loc:
+        return loc.latitude, loc.longitude
+    return None
+
+def main():
+    st.title("🏫 Institute Geolocation Finder")
+    st.write("Enter an institute name or code below and hit **Find** to get its latitude and longitude.")
+    
+    institute_query = st.text_input("Institute Name or Code")
+    
+    if st.button("Find"):
+        if not institute_query.strip():
+            st.warning("Please enter an institute name or code to search.")
+            return
+        
+        result = get_location(institute_query)
+        if result:
+            lat, lon = result
+            st.success(f"**Latitude:** {lat:.6f}    **Longitude:** {lon:.6f}")
+            # Display on a map
+            st.map({"lat": [lat], "lon": [lon]})
+        else:
+            st.error("⚠️ Could not find that institute. Please check the spelling or try a different query.")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        name = " ".join(sys.argv[1:])
-    else:
-        name = input("Enter institute name: ").strip()
-    lat, lon = geocode(name)
-    if lat is not None:
-        print(f"Latitude: {lat}\nLongitude: {lon}")
-    else:
-        print("Coordinates not found")
+    main()
