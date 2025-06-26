@@ -60,23 +60,20 @@ TEMPLATE = '''<!doctype html>
 </body>
 </html>'''
 
-# Geocode helper: ArcGIS first, then Nominatim
+# Geocode helper: ArcGIS first, then Nominatim fallback
 
 def geocode_address(name):
-    # Try ArcGIS (POI and address support)
     try:
         loc = arcgis.geocode(name, exactly_one=True)
         if loc:
             return loc.latitude, loc.longitude
     except GeocoderServiceError:
         pass
-    # Fallback to Nominatim
     for _ in range(2):
         try:
             loc = osm.geocode(name, exactly_one=True)
             if loc:
                 return loc.latitude, loc.longitude
-            # try bias to USA
             loc = osm.geocode(f"{name}, USA", exactly_one=True)
             if loc:
                 return loc.latitude, loc.longitude
@@ -84,11 +81,28 @@ def geocode_address(name):
             time.sleep(1)
     return None, None
 
-# Split text input into names
+# Split text input into names, ignoring commas inside parentheses
 
 def split_names(text):
-    parts = re.split(r'[\r\n,]+', text)
-    return [p.strip() for p in parts if p.strip()]
+    names = []
+    buf = ''
+    depth = 0
+    for ch in text:
+        if ch == '(':
+            depth += 1
+            buf += ch
+        elif ch == ')':
+            depth = max(depth - 1, 0)
+            buf += ch
+        elif (ch == ',' and depth == 0) or ch in ['\n', '\r']:
+            if buf.strip():
+                names.append(buf.strip())
+            buf = ''
+        else:
+            buf += ch
+    if buf.strip():
+        names.append(buf.strip())
+    return names
 
 # Batch geocode with concurrency, preserving input order
 
@@ -124,7 +138,6 @@ def index():
             names = split_names(text)
         if names:
             results = batch_geocode(names)
-            # Prepare CSV
             buf = io.StringIO()
             buf.write('institute,latitude,longitude\n')
             for inst, lat, lon in results:
