@@ -6,15 +6,18 @@ import time
 import re
 from flask import Flask, request, render_template_string, send_file
 import pandas as pd
-import requests
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
+from geopy.geocoders import ArcGIS, Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Initialize Flask app
+# Initialize Flask
 app = Flask(__name__)
 
-# HTML template: file upload or text input, results table, download link
+# Configure geocoders
+arcgis = ArcGIS(timeout=10)
+osm = Nominatim(user_agent="InstituteGeocoder/1.0")
+
+# HTML template
 TEMPLATE = '''<!doctype html>
 <html>
 <head>
@@ -30,7 +33,7 @@ TEMPLATE = '''<!doctype html>
       <input type="file" name="file" accept=".csv,.xls,.xlsx" class="form-control">
     </div>
     <div class="mb-3">
-      <label class="form-label">Or paste institutes (newline or comma-separated):</label>
+      <label class="form-label">Or paste institutes (one per line or comma-separated):</label>
       <textarea name="text_input" rows="4" class="form-control"></textarea>
     </div>
     <button type="submit" class="btn btn-primary">Geocode</button>
@@ -57,65 +60,57 @@ TEMPLATE = '''<!doctype html>
 </body>
 </html>'''
 
-# Initialize geocoder
-osm = Nominatim(user_agent="InstituteGeocoder/1.0")
-
-# Geocode helper: try Census API first, then Nominatim
+# Geocode helper: ArcGIS first, then Nominatim
 
 def geocode_address(name):
-    # Census API
+    # Try ArcGIS (POI and address support)
     try:
-        resp = requests.get(
-            'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress',
-            params={'address': f"{name}, USA", 'benchmark': 'Public_AR_Current', 'format': 'json'},
-            timeout=5
-        )
-        data = resp.json()
-        matches = data.get('result', {}).get('addressMatches', [])
-        if matches:
-            coord = matches[0]['coordinates']
-            return coord['y'], coord['x']
-    except Exception:
+        loc = arcgis.geocode(name, exactly_one=True)
+        if loc:
+            return loc.latitude, loc.longitude
+    except GeocoderServiceError:
         pass
-    # Nominatim fallback
+    # Fallback to Nominatim
     for _ in range(2):
         try:
-            loc = osm.geocode(f"{name}, USA", timeout=10)
+            loc = osm.geocode(name, exactly_one=True)
             if loc:
                 return loc.latitude, loc.longitude
-        except (GeocoderTimedOut, GeocoderUnavailable):
+            # try bias to USA
+            loc = osm.geocode(f"{name}, USA", exactly_one=True)
+            if loc:
+                return loc.latitude, loc.longitude
+        except GeocoderTimedOut:
             time.sleep(1)
     return None, None
 
-# Split text input into institute names
+# Split text input into names
 
 def split_names(text):
     parts = re.split(r'[\r\n,]+', text)
     return [p.strip() for p in parts if p.strip()]
 
-# Batch geocode with ThreadPoolExecutor
+# Batch geocode with concurrency, preserving input order
+
 def batch_geocode(names, max_workers=10):
-    results = []
+    futures = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(geocode_address, name): name for name in names}
-        for future in as_completed(future_map):
-            name = future_map[future]
-            try:
-                lat, lon = future.result()
-            except Exception:
-                lat, lon = (None, None)
-            results.append((name, lat, lon))
-    # preserve input order
-    # results currently in completion order; reorder
-    name_to_coord = {r[0]: (r[1], r[2]) for r in results}
-    return [(n, *(name_to_coord[n])) for n in names]
+        for name in names:
+            futures.append((name, executor.submit(geocode_address, name)))
+    results = []
+    for name, fut in futures:
+        try:
+            lat, lon = fut.result()
+        except Exception:
+            lat, lon = None, None
+        results.append((name, lat, lon))
+    return results
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     results = None
     token = None
     if request.method == 'POST':
-        # Determine list of names
         names = []
         f = request.files.get('file')
         if f and f.filename:
@@ -129,7 +124,7 @@ def index():
             names = split_names(text)
         if names:
             results = batch_geocode(names)
-            # Prepare CSV download
+            # Prepare CSV
             buf = io.StringIO()
             buf.write('institute,latitude,longitude\n')
             for inst, lat, lon in results:
