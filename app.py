@@ -13,7 +13,6 @@ from dask import delayed, compute
 from dask.distributed import Client
 
 # Initialize Dask client for parallel geocoding
-# This will use all available threads by default
 client = Client(processes=False)
 
 app = Flask(__name__)
@@ -61,7 +60,6 @@ TEMPLATE = '''<!doctype html>
 osm = Nominatim(user_agent="InstituteGeocoder/1.0")
 
 # Single geocode: Census API fallback then OSM
-
 def geocode_address(name):
     try:
         resp = requests.get(
@@ -86,18 +84,14 @@ def geocode_address(name):
     return None, None
 
 # Split text input
-
 def split_names(text):
     parts = re.split(r'[\r\n,]+', text)
     return [p.strip() for p in parts if p.strip()]
 
 # Batch geocode using Dask
-
 def batch_geocode(names):
     tasks = [delayed(geocode_address)(name) for name in names]
-    # Trigger parallel computation
     coords = compute(*tasks, scheduler='threads')
-    # coords is a tuple of (lat, lon) per name
     return list(zip(names, coords))
 
 @app.route('/', methods=['GET', 'POST'])
@@ -115,7 +109,6 @@ def index():
             names = split_names(text)
         if names:
             results = batch_geocode(names)
-            # prepare CSV
             buf = io.StringIO()
             buf.write('institute,latitude,longitude\n')
             for inst, (lat, lon) in results:
