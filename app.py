@@ -8,7 +8,6 @@ from flask import Flask, request, render_template_string, send_file
 import pandas as pd
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # HTML template with two forms: batch file upload and free-text input
 TEMPLATE = """<!doctype html>
@@ -54,38 +53,33 @@ TEMPLATE = """<!doctype html>
 </html>
 """
 
-# Concurrency settings
-MAX_WORKERS = int(os.getenv('MAX_WORKERS', '50'))
-DELAY = float(os.getenv('DELAY', '0.0'))
+# For free-tier Nominatim: enforce 1 request/sec
+MAX_WORKERS = 1
+DELAY = 1.0  # seconds
 
 # Initialize Flask app and geocoder
 app = Flask(__name__)
 geolocator = Nominatim(user_agent="InstituteGeocoder/1.0")
 
-# Single geocode with retry logic
-def geocode_name(name, retries=2):
+# Geocode a single institute name with US bias and retries
+def geocode_name(name, retries=3):
+    query = f"{name}, USA"
     for _ in range(retries):
         try:
-            loc = geolocator.geocode(name, timeout=10)
+            loc = geolocator.geocode(query, timeout=10, country_codes="us")
             if loc:
                 return loc.latitude, loc.longitude
         except (GeocoderTimedOut, GeocoderUnavailable):
             time.sleep(1)
     return None, None
 
-# Batch geocode function using ThreadPoolExecutor
+# Batch geocode using single-thread and delay
 def batch_geocode(names):
-    coords = [None] * len(names)
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(geocode_name, n): idx for idx, n in enumerate(names)}
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                coords[idx] = future.result()
-            except Exception:
-                coords[idx] = (None, None)
-            if DELAY:
-                time.sleep(DELAY)
+    coords = []
+    for name in names:
+        lat, lng = geocode_name(name)
+        coords.append((lat, lng))
+        time.sleep(DELAY)
     return coords
 
 @app.route('/', methods=['GET', 'POST'])
