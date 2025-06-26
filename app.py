@@ -5,7 +5,8 @@ import io
 import time
 from flask import Flask, request, render_template_string, send_file
 import pandas as pd
-import googlemaps
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Simplified HTML template without maps
@@ -39,28 +40,23 @@ TEMPLATE = """<!doctype html>
 </html>
 """
 
-# Ensure a Google Maps API key is set
-API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
-if not API_KEY:
-    raise RuntimeError("Set the GOOGLE_MAPS_API_KEY environment variable.")
-
-# Initialize client
-gmaps = googlemaps.Client(key=API_KEY)
+# Initialize geocoder
+geolocator = Nominatim(user_agent="InstituteGeocoder/1.0")
 app = Flask(__name__)
 
 # Geocode a single institute name
-def geocode_name(name):
-    try:
-        results = gmaps.geocode(name)
-        if results:
-            loc = results[0]['geometry']['location']
-            return loc['lat'], loc['lng']
-    except Exception:
-        pass
+def geocode_name(name, retries=3):
+    for _ in range(retries):
+        try:
+            loc = geolocator.geocode(name, timeout=10)
+            if loc:
+                return loc.latitude, loc.longitude
+        except (GeocoderTimedOut, GeocoderUnavailable):
+            time.sleep(1)
     return None, None
 
 # Batch geocode with concurrency and throttling
-def batch_geocode(names, max_workers=10):
+def batch_geocode(names, max_workers=10, delay=0.1):
     coords = [None] * len(names)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(geocode_name, name): i for i, name in enumerate(names)}
@@ -70,7 +66,7 @@ def batch_geocode(names, max_workers=10):
                 coords[idx] = future.result()
             except Exception:
                 coords[idx] = (None, None)
-            time.sleep(0.1)
+            time.sleep(delay)
     return coords
 
 @app.route('/', methods=['GET','POST'])
@@ -80,7 +76,7 @@ def index():
         if not f:
             return render_template_string(TEMPLATE, error='No file uploaded.', preview=None)
         try:
-            df = pd.read_excel(f) if f.filename.lower().endswith(('.xls','.xlsx')) else pd.read_csv(f)
+            df = pd.read_excel(f) if f.filename.lower().endswith(('.xls', '.xlsx')) else pd.read_csv(f)
         except Exception as e:
             return render_template_string(TEMPLATE, error=f'Error reading file: {e}', preview=None)
         if 'institute' not in df.columns:
@@ -92,7 +88,7 @@ def index():
 
         buf = io.BytesIO()
         base = f.filename.rsplit('.',1)[0]
-        if f.filename.lower().endswith(('.xls','.xlsx')):
+        if f.filename.lower().endswith(('.xls', '.xlsx')):
             with pd.ExcelWriter(buf, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False)
             mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
