@@ -10,7 +10,7 @@ from geopy.geocoders import ArcGIS
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# HTML template for batch upload and free-text geocoding
+# HTML template with manual table rendering for perfect alignment
 TEMPLATE = """<!doctype html>
 <html>
 <head>
@@ -43,9 +43,29 @@ TEMPLATE = """<!doctype html>
   {% if error %}
     <div class=\"alert alert-danger\">{{ error }}</div>
   {% endif %}
-  {% if preview %}
+
+  {% if results %}
     <h2>Results</h2>
-    {{ preview|safe }}
+    <div class=\"table-responsive\">
+      <table class=\"table table-striped\">
+        <thead>
+          <tr>
+            <th>Institute</th>
+            <th>Latitude</th>
+            <th>Longitude</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in results %}
+          <tr>
+            <td>{{ r.institute }}</td>
+            <td>{{ '%.6f'|format(r.latitude) if r.latitude is not none else '' }}</td>
+            <td>{{ '%.6f'|format(r.longitude) if r.longitude is not none else '' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
     {% if download_url %}
       <a href=\"{{ download_url }}\" class=\"btn btn-success mt-2\">Download Geocoded File</a>
     {% endif %}
@@ -58,7 +78,7 @@ TEMPLATE = """<!doctype html>
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', '5'))
 DELAY = float(os.getenv('DELAY', '0.2'))
 
-# Initialize
+# Initialize Flask and geocoder
 app = Flask(__name__)
 geolocator = ArcGIS(timeout=10)
 
@@ -73,13 +93,13 @@ def geocode_name(name, retries=2):
             time.sleep(1)
     return None, None
 
-# Batch geocode using ThreadPoolExecutor
+# Batch geocode names
 def batch_geocode(names):
     coords = [None] * len(names)
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_idx = {executor.submit(geocode_name, n): i for i, n in enumerate(names)}
-        for future in as_completed(future_idx):
-            idx = future_idx[future]
+        future_map = {executor.submit(geocode_name, n): i for i, n in enumerate(names)}
+        for future in as_completed(future_map):
+            idx = future_map[future]
             try:
                 coords[idx] = future.result()
             except Exception:
@@ -87,23 +107,23 @@ def batch_geocode(names):
             time.sleep(DELAY)
     return coords
 
-@app.route('/', methods=['GET', 'POST'])
+@app.route('/', methods=['GET','POST'])
 def index():
     error = None
-    preview = None
+    results = []
     download_url = None
 
     if request.method == 'POST':
         action = request.form.get('action')
 
-        # File upload geocoding
         if action == 'geocode_file' and 'file' in request.files:
             f = request.files['file']
             if not f.filename:
                 error = 'No file selected.'
             else:
                 try:
-                    df = pd.read_excel(f) if f.filename.lower().endswith(('.xls', '.xlsx')) else pd.read_csv(f)
+                    df = (pd.read_excel(f) if f.filename.lower().endswith(('.xls','.xlsx'))
+                          else pd.read_csv(f))
                 except Exception as e:
                     error = f'Error reading file: {e}'
                     df = None
@@ -113,15 +133,16 @@ def index():
                     else:
                         names = df['institute'].astype(str).tolist()
                         coords = batch_geocode(names)
+                        # build results list
+                        results = [
+                            {'institute': n, 'latitude': c[0], 'longitude': c[1]}
+                            for n, c in zip(names, coords)
+                        ]
+                        # prepare download
                         df['latitude'], df['longitude'] = zip(*coords)
-
-                        # Preview & download preparation
-                        preview_df = df[['institute', 'latitude', 'longitude']].head()
-                        preview = preview_df.to_html(classes='table table-striped', index=False)
-
                         buf = io.BytesIO()
                         base = os.path.splitext(f.filename)[0]
-                        if f.filename.lower().endswith(('.xls', '.xlsx')):
+                        if f.filename.lower().endswith(('.xls','.xlsx')):
                             df.to_excel(buf, index=False)
                             mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                             fname = f'{base}_geocoded.xlsx'
@@ -130,27 +151,23 @@ def index():
                             mimetype = 'text/csv'
                             fname = f'{base}_geocoded.csv'
                         buf.seek(0)
-                        token = f'{base}_token'
+                        token = base + '_token'
                         app.config[token] = (buf, fname, mimetype)
                         download_url = f'/download/{token}'
 
-        # Free-text geocoding
         elif action == 'geocode_text':
             text = request.form.get('text_input', '')
             if not text.strip():
                 error = 'No text provided.'
             else:
-                names = [p.strip() for p in re.split(r'[
-,]+', text) if p.strip()]
+                names = [p.strip() for p in re.split(r'[\r\n,]+', text) if p.strip()]
                 coords = batch_geocode(names)
-                df = pd.DataFrame({
-                    'institute': names,
-                    'latitude': [c[0] for c in coords],
-                    'longitude': [c[1] for c in coords]
-                })
-                preview = df[['institute', 'latitude', 'longitude']].to_html(classes='table table-striped', index=False)
+                results = [
+                    {'institute': n, 'latitude': c[0], 'longitude': c[1]}
+                    for n, c in zip(names, coords)
+                ]
 
-    return render_template_string(TEMPLATE, error=error, preview=preview, download_url=download_url)
+    return render_template_string(TEMPLATE, error=error, results=results, download_url=download_url)
 
 @app.route('/download/<token>')
 def download(token):
