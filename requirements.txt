@@ -3,6 +3,6 @@ pandas>=2.0
 openpyxl
 requests
 geopy==2.4.1
-dask==2025.6.0
-distributed==2025.6.0
+dask>=2024.12.1
+distributed>=2024.12.1
 gunicorn==20.1.0
