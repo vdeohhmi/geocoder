@@ -40,12 +40,17 @@ TEMPLATE = """<!doctype html>
 </html>
 """
 
+# Load concurrency settings from environment
+MAX_WORKERS = int(os.getenv('MAX_WORKERS', '50'))
+DELAY = float(os.getenv('DELAY', '0.0'))  # seconds between requests
+
 # Initialize geocoder
 geolocator = Nominatim(user_agent="InstituteGeocoder/1.0")
 app = Flask(__name__)
 
-# Geocode a single institute name
-def geocode_name(name, retries=3):
+# Geocode a single institute name with retries
+
+def geocode_name(name, retries=2):
     for _ in range(retries):
         try:
             loc = geolocator.geocode(name, timeout=10)
@@ -55,18 +60,19 @@ def geocode_name(name, retries=3):
             time.sleep(1)
     return None, None
 
-# Batch geocode with concurrency and throttling
-def batch_geocode(names, max_workers=10, delay=0.1):
+# Batch geocode with concurrency
+def batch_geocode(names):
     coords = [None] * len(names)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(geocode_name, name): i for i, name in enumerate(names)}
-        for future in as_completed(futures):
-            idx = futures[future]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_idx = {executor.submit(geocode_name, name): idx for idx, name in enumerate(names)}
+        for future in as_completed(future_to_idx):
+            i = future_to_idx[future]
             try:
-                coords[idx] = future.result()
+                coords[i] = future.result()
             except Exception:
-                coords[idx] = (None, None)
-            time.sleep(delay)
+                coords[i] = (None, None)
+            if DELAY > 0:
+                time.sleep(DELAY)
     return coords
 
 @app.route('/', methods=['GET','POST'])
@@ -117,3 +123,15 @@ def download(token):
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8000)))
+
+# requirements.txt
+# ----------------
+Flask==2.3.2
+geopy==2.4.1
+pandas>=2.0
+openpyxl
+gunicorn==20.1.0
+
+# Procfile
+# --------
+web: gunicorn app:app --timeout 300 --workers 2
