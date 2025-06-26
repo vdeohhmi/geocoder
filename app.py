@@ -6,11 +6,11 @@ import time
 import re
 from flask import Flask, request, render_template_string, send_file
 import pandas as pd
-from geopy.geocoders import ArcGIS
-from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# HTML template with manual table rendering for perfect alignment
+# HTML template for batch and free-text geocoding
 TEMPLATE = """<!doctype html>
 <html>
 <head>
@@ -20,7 +20,7 @@ TEMPLATE = """<!doctype html>
 </head>
 <body class=\"p-4\">
   <h1>Institute Geocoder</h1>
-  <p class=\"text-muted\">Powered by ArcGIS Public Geocoder (no API key required)</p>
+  <p class=\"text-muted\">Using Nominatim (OpenStreetMap) with U.S. bias</p>
 
   <h2>Batch Upload</h2>
   <form method=\"post\" enctype=\"multipart/form-data\" class=\"mb-4\">
@@ -34,7 +34,7 @@ TEMPLATE = """<!doctype html>
   <h2>Free Text Geocoding</h2>
   <form method=\"post\" class=\"mb-4\">
     <div class=\"mb-3\">
-      <label for=\"text_input\" class=\"form-label\">Paste institute names (one per line or comma-separated):</label>
+      <label for=\"text_input\" class=\"form-label\">Paste institute names (newline or comma separated):</label>
       <textarea id=\"text_input\" name=\"text_input\" rows=6 class=\"form-control\" required></textarea>
     </div>
     <button name=\"action\" value=\"geocode_text\" type=\"submit\" class=\"btn btn-secondary\">Geocode Text</button>
@@ -74,22 +74,23 @@ TEMPLATE = """<!doctype html>
 </html>
 """
 
-# Throttle settings
-MAX_WORKERS = int(os.getenv('MAX_WORKERS', '5'))
-DELAY = float(os.getenv('DELAY', '0.2'))
+# Throttle settings (1 req/sec for Nominatim policy)
+MAX_WORKERS = 2
+DELAY = 1.0
 
-# Initialize Flask and geocoder
+# Initialize Flask app and Nominatim geocoder
 app = Flask(__name__)
-geolocator = ArcGIS(timeout=10)
+geolocator = Nominatim(user_agent="InstituteGeocoder/1.0")
 
-# Geocode with retries
+# Geocode with U.S. bias and retries
 def geocode_name(name, retries=2):
+    query = f"{name}, USA"
     for _ in range(retries + 1):
         try:
-            loc = geolocator.geocode(name)
+            loc = geolocator.geocode(query, timeout=10, exactly_one=True)
             if loc:
                 return loc.latitude, loc.longitude
-        except (GeocoderTimedOut, GeocoderServiceError):
+        except (GeocoderTimedOut, GeocoderUnavailable):
             time.sleep(1)
     return None, None
 
@@ -116,6 +117,7 @@ def index():
     if request.method == 'POST':
         action = request.form.get('action')
 
+        # File geocoding workflow
         if action == 'geocode_file' and 'file' in request.files:
             f = request.files['file']
             if not f.filename:
@@ -125,36 +127,35 @@ def index():
                     df = (pd.read_excel(f) if f.filename.lower().endswith(('.xls','.xlsx'))
                           else pd.read_csv(f))
                 except Exception as e:
-                    error = f'Error reading file: {e}'
+                    error = f'Reading error: {e}'
                     df = None
-                if df is not None:
-                    if 'institute' not in df.columns:
-                        error = "Missing 'institute' column."
+                if df is not None and 'institute' in df.columns:
+                    names = df['institute'].astype(str).tolist()
+                    coords = batch_geocode(names)
+                    df['latitude'], df['longitude'] = zip(*coords)
+                    results = [
+                        {'institute': n, 'latitude': c[0], 'longitude': c[1]}
+                        for n, c in zip(names, coords)
+                    ]
+                    # prepare file download
+                    buf = io.BytesIO()
+                    base = os.path.splitext(f.filename)[0]
+                    if f.filename.lower().endswith(('.xls','.xlsx')):
+                        df.to_excel(buf, index=False)
+                        mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                        fname = f'{base}_geocoded.xlsx'
                     else:
-                        names = df['institute'].astype(str).tolist()
-                        coords = batch_geocode(names)
-                        # build results list
-                        results = [
-                            {'institute': n, 'latitude': c[0], 'longitude': c[1]}
-                            for n, c in zip(names, coords)
-                        ]
-                        # prepare download
-                        df['latitude'], df['longitude'] = zip(*coords)
-                        buf = io.BytesIO()
-                        base = os.path.splitext(f.filename)[0]
-                        if f.filename.lower().endswith(('.xls','.xlsx')):
-                            df.to_excel(buf, index=False)
-                            mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                            fname = f'{base}_geocoded.xlsx'
-                        else:
-                            buf.write(df.to_csv(index=False).encode('utf-8'))
-                            mimetype = 'text/csv'
-                            fname = f'{base}_geocoded.csv'
-                        buf.seek(0)
-                        token = base + '_token'
-                        app.config[token] = (buf, fname, mimetype)
-                        download_url = f'/download/{token}'
+                        buf.write(df.to_csv(index=False).encode('utf-8'))
+                        mimetype = 'text/csv'
+                        fname = f'{base}_geocoded.csv'
+                    buf.seek(0)
+                    token = base + '_token'
+                    app.config[token] = (buf, fname, mimetype)
+                    download_url = f'/download/{token}'
+                else:
+                    error = "Missing 'institute' column."
 
+        # Free-text geocoding
         elif action == 'geocode_text':
             text = request.form.get('text_input', '')
             if not text.strip():
@@ -171,10 +172,10 @@ def index():
 
 @app.route('/download/<token>')
 def download(token):
-    entry = app.config.get(token)
-    if not entry:
+    data = app.config.get(token)
+    if not data:
         return 'Invalid token', 404
-    buf, fname, mimetype = entry
+    buf, fname, mimetype = data
     buf.seek(0)
     return send_file(buf, as_attachment=True, download_name=fname, mimetype=mimetype)
 
