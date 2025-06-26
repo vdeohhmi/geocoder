@@ -54,15 +54,15 @@ TEMPLATE = """<!doctype html>
 </html>
 """
 
-# Concurrency & throttle settings
+# Throttle settings
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', '5'))
 DELAY = float(os.getenv('DELAY', '0.2'))
 
-# Initialize Flask app and ArcGIS geocoder
+# Initialize
 app = Flask(__name__)
 geolocator = ArcGIS(timeout=10)
 
-# Single geocode with retries and error handling
+# Geocode with retries
 def geocode_name(name, retries=2):
     for _ in range(retries + 1):
         try:
@@ -77,9 +77,9 @@ def geocode_name(name, retries=2):
 def batch_geocode(names):
     coords = [None] * len(names)
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_idx = {executor.submit(geocode_name, n): i for i, n in enumerate(names)}
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
+        future_idx = {executor.submit(geocode_name, n): i for i, n in enumerate(names)}
+        for future in as_completed(future_idx):
+            idx = future_idx[future]
             try:
                 coords[idx] = future.result()
             except Exception:
@@ -95,6 +95,7 @@ def index():
 
     if request.method == 'POST':
         action = request.form.get('action')
+
         # File upload geocoding
         if action == 'geocode_file' and 'file' in request.files:
             f = request.files['file']
@@ -102,8 +103,7 @@ def index():
                 error = 'No file selected.'
             else:
                 try:
-                    df = (pd.read_excel(f) if f.filename.lower().endswith(('.xls', '.xlsx'))
-                          else pd.read_csv(f))
+                    df = pd.read_excel(f) if f.filename.lower().endswith(('.xls', '.xlsx')) else pd.read_csv(f)
                 except Exception as e:
                     error = f'Error reading file: {e}'
                     df = None
@@ -113,7 +113,12 @@ def index():
                     else:
                         names = df['institute'].astype(str).tolist()
                         coords = batch_geocode(names)
-                        df[['latitude', 'longitude']] = pd.DataFrame(coords)
+                        df['latitude'], df['longitude'] = zip(*coords)
+
+                        # Preview & download preparation
+                        preview_df = df[['institute', 'latitude', 'longitude']].head()
+                        preview = preview_df.to_html(classes='table table-striped', index=False)
+
                         buf = io.BytesIO()
                         base = os.path.splitext(f.filename)[0]
                         if f.filename.lower().endswith(('.xls', '.xlsx')):
@@ -127,20 +132,23 @@ def index():
                         buf.seek(0)
                         token = f'{base}_token'
                         app.config[token] = (buf, fname, mimetype)
-                        preview = df.head().to_html(classes='table table-striped', index=False)
                         download_url = f'/download/{token}'
-        # Free text geocoding
+
+        # Free-text geocoding
         elif action == 'geocode_text':
             text = request.form.get('text_input', '')
             if not text.strip():
                 error = 'No text provided.'
             else:
-                names = [p.strip() for p in re.split(r'[\r\n,]+', text) if p.strip()]
+                names = [p.strip() for p in re.split(r'[
+,]+', text) if p.strip()]
                 coords = batch_geocode(names)
-                df = pd.DataFrame({'institute': names,
-                                   'latitude': [c[0] for c in coords],
-                                   'longitude': [c[1] for c in coords]})
-                preview = df.to_html(classes='table table-striped', index=False)
+                df = pd.DataFrame({
+                    'institute': names,
+                    'latitude': [c[0] for c in coords],
+                    'longitude': [c[1] for c in coords]
+                })
+                preview = df[['institute', 'latitude', 'longitude']].to_html(classes='table table-striped', index=False)
 
     return render_template_string(TEMPLATE, error=error, preview=preview, download_url=download_url)
 
