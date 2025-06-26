@@ -1,2 +1,8 @@
 Flask==2.3.2
+pandas>=2.0
+openpyxl
+requests
+geopy==2.4.1
+dask==2025.6.0
+distributed==2025.6.0
 gunicorn==20.1.0
