@@ -1,145 +1,141 @@
 # app.py
 #!/usr/bin/env python3
-from flask import Flask, render_template_string
 import os
+import io
+import time
+import re
+from flask import Flask, request, render_template_string, send_file
+import pandas as pd
+import requests
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
+from dask import delayed, compute
+from dask.distributed import Client
+
+# Initialize Dask client for parallel geocoding
+# This will use all available threads by default
+client = Client(processes=False)
 
 app = Flask(__name__)
 
-# Use `defer` for scripts and wrap JS in DOMContentLoaded
-TEMPLATE = """<!doctype html>
+# HTML template: simple forms and table
+TEMPLATE = '''<!doctype html>
 <html>
 <head>
-  <meta charset=\"utf-8\">
-  <title>Institute Geocoder</title>
-  <link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css\"/>
-  <script src=\"https://cdn.jsdelivr.net/npm/papaparse@5.3.2/papaparse.min.js\" defer></script>
-  <script src=\"https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js\" defer></script>
+  <meta charset="utf-8">
+  <title>Institute Geocoder (Dask Accelerated)</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css"/>
 </head>
-<body class=\"p-4\">
-  <h1>Institute Geocoder</h1>
+<body class="p-4">
+  <h1>Institute Geocoder (Dask)</h1>
+  <form method="post" enctype="multipart/form-data">
+    <div class="mb-3">
+      <label class="form-label">Upload CSV/XLSX with <code>institute</code> column:</label>
+      <input type="file" name="file" accept=".csv,.xls,.xlsx" class="form-control">
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Or paste institutes (one per line or comma-separated):</label>
+      <textarea name="text_input" rows="4" class="form-control"></textarea>
+    </div>
+    <button type="submit" class="btn btn-primary">Geocode</button>
+  </form>
 
-  <h2>Batch Upload (CSV/XLSX)</h2>
-  <input type=\"file\" id=\"file-input\" accept=\".csv,.xls,.xlsx\" class=\"form-control mb-3\">
-  <button id=\"process-file\" type=\"button\" class=\"btn btn-primary mb-4\">Process File</button>
-
-  <h2>Free Text Geocoding</h2>
-  <textarea id=\"text-input\" rows=6 placeholder=\"One institute per line, or comma-separated\" class=\"form-control mb-3\"></textarea>
-  <button id=\"process-text\" type=\"button\" class=\"btn btn-secondary mb-4\">Process Text</button>
-
-  <h2>Results</h2>
-  <div class=\"table-responsive\">
-    <table id=\"results-table\" class=\"table table-bordered table-striped\">
-      <thead><tr><th>Institute</th><th>Latitude</th><th>Longitude</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </div>
-  <button id=\"download-btn\" type=\"button\" class=\"btn btn-success mt-2\" disabled>Download CSV</button>
-
-  <script defer>
-    document.addEventListener('DOMContentLoaded', () => {
-      console.log('DOM fully loaded and parsed');
-
-      async function geocode(name) {
-        console.log('Geocoding:', name);
-        // Census API
-        let url = 'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress';
-        let params = new URLSearchParams({ address: name + ', USA', benchmark: 'Public_AR_Current', format: 'json' });
-        try {
-          let res = await fetch(`${url}?${params}`);
-          let data = await res.json();
-          let matches = data.result.addressMatches;
-          if (matches && matches.length) {
-            return [matches[0].coordinates.y, matches[0].coordinates.x];
-          }
-        } catch (e) {
-          console.warn('Census error', e);
-        }
-        // Nominatim fallback
-        try {
-          let nomUrl = 'https://nominatim.openstreetmap.org/search?format=json&q=' + encodeURIComponent(name + ', USA');
-          let nomRes = await fetch(nomUrl);
-          let nomData = await nomRes.json();
-          if (nomData && nomData.length) {
-            return [parseFloat(nomData[0].lat), parseFloat(nomData[0].lon)];
-          }
-        } catch (e) {
-          console.warn('Nominatim error', e);
-        }
-        return [null, null];
-      }
-
-      function enableDownload() {
-        document.getElementById('download-btn').disabled = false;
-      }
-
-      document.getElementById('download-btn').addEventListener('click', () => {
-        console.log('Download clicked');
-        let rows = Array.from(document.querySelectorAll('#results-table tbody tr'));
-        let csv = ['institute,latitude,longitude'];
-        rows.forEach(r => {
-          let cols = Array.from(r.children).map(td => td.textContent.trim());
-          csv.push(cols.join(','));
-        });
-        let blob = new Blob([csv.join('\n')], { type: 'text/csv' });
-        let url = URL.createObjectURL(blob);
-        let a = document.createElement('a'); a.href = url; a.download = 'geocoded.csv'; a.click();
-        URL.revokeObjectURL(url);
-      });
-
-      async function processList(list) {
-        console.log('Processing list', list);
-        let tbody = document.querySelector('#results-table tbody');
-        tbody.innerHTML = '';
-        for (let name of list) {
-          let tr = document.createElement('tr');
-          tr.innerHTML = `<td>${name}</td><td>...</td><td>...</td>`;
-          tbody.appendChild(tr);
-          let [lat, lon] = await geocode(name);
-          tr.children[1].textContent = lat != null ? lat.toFixed(6) : '';
-          tr.children[2].textContent = lon != null ? lon.toFixed(6) : '';
-        }
-        enableDownload();
-      }
-
-      document.getElementById('process-file').addEventListener('click', () => {
-        console.log('Process File clicked');
-        let input = document.getElementById('file-input').files[0];
-        if (!input) { alert('Select a file first'); return; }
-        let ext = input.name.split('.').pop().toLowerCase();
-        if (ext === 'csv') {
-          Papa.parse(input, { header: true, complete: (r) => {
-            let names = r.data.map(o => o.institute).filter(Boolean);
-            processList(names);
-          }});
-        } else {
-          let reader = new FileReader();
-          reader.onload = e => {
-            let wb = XLSX.read(e.target.result, { type: 'binary' });
-            let data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
-            let names = data.map(o => o.institute).filter(Boolean);
-            processList(names);
-          };
-          reader.readAsBinaryString(input);
-        }
-      });
-
-      document.getElementById('process-text').addEventListener('click', () => {
-        console.log('Process Text clicked');
-        let text = document.getElementById('text-input').value;
-        let lines = text.split(/[\r\n]+/).flatMap(l => l.split(/,(?![^()]*\))/));
-        let names = lines.map(s => s.trim()).filter(Boolean);
-        processList(names);
-      });
-
-    });
-  </script>
+  {% if results %}
+    <h2 class="mt-4">Results</h2>
+    <div class="table-responsive">
+      <table class="table table-bordered table-striped">
+        <thead><tr><th>Institute</th><th>Latitude</th><th>Longitude</th></tr></thead>
+        <tbody>
+        {% for inst,lat,lon in results %}
+          <tr><td>{{ inst }}</td><td>{{ '%.6f'%lat if lat else '' }}</td><td>{{ '%.6f'%lon if lon else '' }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <a href="/download/{{ token }}" class="btn btn-success mt-2">Download CSV</a>
+  {% endif %}
 </body>
-</html>"""
+</html>'''
 
-@app.route('/')
+# Initialize geocoder
+osm = Nominatim(user_agent="InstituteGeocoder/1.0")
+
+# Single geocode: Census API fallback then OSM
+
+def geocode_address(name):
+    try:
+        resp = requests.get(
+            'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress',
+            params={'address': f"{name}, USA", 'benchmark': 'Public_AR_Current', 'format': 'json'},
+            timeout=5
+        )
+        data = resp.json()
+        match = data.get('result', {}).get('addressMatches', [])
+        if match:
+            c = match[0]['coordinates']
+            return c['y'], c['x']
+    except Exception:
+        pass
+    for _ in range(2):
+        try:
+            loc = osm.geocode(f"{name}, USA", timeout=10)
+            if loc:
+                return loc.latitude, loc.longitude
+        except (GeocoderTimedOut, GeocoderUnavailable):
+            time.sleep(1)
+    return None, None
+
+# Split text input
+
+def split_names(text):
+    parts = re.split(r'[\r\n,]+', text)
+    return [p.strip() for p in parts if p.strip()]
+
+# Batch geocode using Dask
+
+def batch_geocode(names):
+    tasks = [delayed(geocode_address)(name) for name in names]
+    # Trigger parallel computation
+    coords = compute(*tasks, scheduler='threads')
+    # coords is a tuple of (lat, lon) per name
+    return list(zip(names, coords))
+
+@app.route('/', methods=['GET', 'POST'])
 def index():
-    return render_template_string(TEMPLATE)
+    results = None
+    token = None
+    if request.method == 'POST':
+        names = []
+        f = request.files.get('file')
+        if f and f.filename:
+            df = (pd.read_excel(f) if f.filename.lower().endswith(('.xls', '.xlsx')) else pd.read_csv(f))
+            names = df['institute'].astype(str).tolist()
+        text = request.form.get('text_input', '').strip()
+        if text:
+            names = split_names(text)
+        if names:
+            results = batch_geocode(names)
+            # prepare CSV
+            buf = io.StringIO()
+            buf.write('institute,latitude,longitude\n')
+            for inst, (lat, lon) in results:
+                buf.write(f"{inst},{lat or ''},{lon or ''}\n")
+            buf.seek(0)
+            token = 'tmp'
+            app.config[token] = buf.getvalue()
+    return render_template_string(TEMPLATE, results=results, token=token)
+
+@app.route('/download/<token>')
+def download(token):
+    data = app.config.get(token)
+    if not data:
+        return 'Not found', 404
+    return send_file(
+        io.BytesIO(data.encode('utf-8')),
+        as_attachment=True,
+        download_name='geocoded.csv',
+        mimetype='text/csv'
+    )
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', '8000'))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8000)))
