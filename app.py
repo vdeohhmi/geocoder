@@ -4,24 +4,25 @@ import os
 import io
 import time
 import re
-import uuid
-from threading import Thread
 from flask import Flask, request, render_template_string, send_file
 import pandas as pd
 import requests
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 from geopy.geocoders import ArcGIS, Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Initialize Flask and in-memory job store
+# Initialize Flask app
+# Initialize Flask
 app = Flask(__name__)
-jobs = {}  # job_id -> {'status': 'pending'|'done', 'results': list, 'csv': str}
 
+# HTML template: file upload or text input, results table, download link
 # Configure geocoders
 arcgis = ArcGIS(timeout=10)
 osm = Nominatim(user_agent="InstituteGeocoder/1.0")
 
-# HTML template for submission, status, results, and download
+# HTML template
 TEMPLATE = '''<!doctype html>
 <html>
 <head>
@@ -31,93 +32,109 @@ TEMPLATE = '''<!doctype html>
 </head>
 <body class="p-4">
   <h1>Institute Geocoder</h1>
-  {% if not job_id %}
-    <form method="post" enctype="multipart/form-data">
-      <div class="mb-3">
-        <label class="form-label">Upload CSV/XLSX with <code>institute</code> column:</label>
-        <input type="file" name="file" accept=".csv,.xls,.xlsx" class="form-control">
-      </div>
-      <div class="mb-3">
-        <label class="form-label">Or paste institutes (one per line or comma-separated):</label>
-        <textarea name="text_input" rows="4" class="form-control"></textarea>
-      </div>
-      <button type="submit" class="btn btn-primary">Start Geocoding</button>
-    </form>
-  {% else %}
-    {% if pending %}
-      <div class="alert alert-info">Job {{ job_id }} is processing... Please refresh this page.</div>
-    {% elif results %}
-      <h2 class="mt-4">Results for Job {{ job_id }}</h2>
-      <div class="table-responsive">
-        <table class="table table-bordered table-striped">
-          <thead><tr><th>Institute</th><th>Latitude</th><th>Longitude</th></tr></thead>
-          <tbody>
-          {% for inst, lat, lon in results %}
-            <tr>
-              <td>{{ inst }}</td>
-              <td>{{ '%.6f'|format(lat) if lat is not none else '' }}</td>
-              <td>{{ '%.6f'|format(lon) if lon is not none else '' }}</td>
-            </tr>
-          {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      <a href="/download/{{ job_id }}" class="btn btn-success mt-2">Download CSV</a>
-    {% else %}
-      <div class="alert alert-danger">Job {{ job_id }} not found.</div>
-    {% endif %}
+  <form method="post" enctype="multipart/form-data">
+    <div class="mb-3">
+      <label class="form-label">Upload CSV/XLSX with <code>institute</code> column:</label>
+      <input type="file" name="file" accept=".csv,.xls,.xlsx" class="form-control">
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Or paste institutes (newline or comma-separated):</label>
+      <label class="form-label">Or paste institutes (one per line or comma-separated):</label>
+      <textarea name="text_input" rows="4" class="form-control"></textarea>
+    </div>
+    <button type="submit" class="btn btn-primary">Geocode</button>
+  </form>
+
+  {% if results %}
+    <h2 class="mt-4">Results</h2>
+    <div class="table-responsive">
+      <table class="table table-bordered table-striped">
+        <thead><tr><th>Institute</th><th>Latitude</th><th>Longitude</th></tr></thead>
+        <tbody>
+        {% for inst, lat, lon in results %}
+          <tr>
+            <td>{{ inst }}</td>
+            <td>{{ '%.6f'|format(lat) if lat is not none else '' }}</td>
+            <td>{{ '%.6f'|format(lon) if lon is not none else '' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <a href="/download/{{ token }}" class="btn btn-success mt-2">Download CSV</a>
   {% endif %}
 </body>
 </html>'''
 
-# Geocode a single institute name
+# Initialize geocoder
+osm = Nominatim(user_agent="InstituteGeocoder/1.0")
+
+# Geocode helper: try Census API first, then Nominatim
+# Geocode helper: ArcGIS first, then Nominatim
+
 def geocode_address(name):
-    # Try ArcGIS
+    # Census API
+    # Try ArcGIS (POI and address support)
     try:
+        resp = requests.get(
+            'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress',
+            params={'address': f"{name}, USA", 'benchmark': 'Public_AR_Current', 'format': 'json'},
+            timeout=5
+        )
+        data = resp.json()
+        matches = data.get('result', {}).get('addressMatches', [])
+        if matches:
+            coord = matches[0]['coordinates']
+            return coord['y'], coord['x']
+    except Exception:
         loc = arcgis.geocode(name, exactly_one=True)
         if loc:
             return loc.latitude, loc.longitude
     except GeocoderServiceError:
         pass
-    # Fallback to OSM
+    # Nominatim fallback
+    # Fallback to Nominatim
     for _ in range(2):
         try:
+            loc = osm.geocode(f"{name}, USA", timeout=10)
             loc = osm.geocode(name, exactly_one=True)
             if loc:
                 return loc.latitude, loc.longitude
-            # also try with "USA" bias
+            # try bias to USA
             loc = osm.geocode(f"{name}, USA", exactly_one=True)
             if loc:
                 return loc.latitude, loc.longitude
-        except (GeocoderTimedOut, GeocoderServiceError):
+        except (GeocoderTimedOut, GeocoderUnavailable):
+        except GeocoderTimedOut:
             time.sleep(1)
     return None, None
 
-# Split input text into institute names, preserving parentheses
-def split_names(text):
-    names = []
-    for line in text.splitlines():
-        buf = ''
-        depth = 0
-        for ch in line:
-            if ch == '(':
-                depth += 1
-            elif ch == ')':
-                depth = max(depth-1, 0)
-            if ch == ',' and depth == 0:
-                if buf.strip():
-                    names.append(buf.strip())
-                buf = ''
-            else:
-                buf += ch
-        if buf.strip():
-            names.append(buf.strip())
-    return names
+# Split text input into institute names
+# Split text input into names
 
-# Batch geocode names concurrently, preserving order
-def batch_geocode(names, workers=10):
+def split_names(text):
+    parts = re.split(r'[\r\n,]+', text)
+    return [p.strip() for p in parts if p.strip()]
+
+# Batch geocode with ThreadPoolExecutor
+# Batch geocode with concurrency, preserving input order
+
+def batch_geocode(names, max_workers=10):
+    results = []
     futures = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(geocode_address, name): name for name in names}
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                lat, lon = future.result()
+            except Exception:
+                lat, lon = (None, None)
+            results.append((name, lat, lon))
+    # preserve input order
+    # results currently in completion order; reorder
+    name_to_coord = {r[0]: (r[1], r[2]) for r in results}
+    return [(n, *(name_to_coord[n])) for n in names]
         for name in names:
             futures.append((name, executor.submit(geocode_address, name)))
     results = []
@@ -125,16 +142,16 @@ def batch_geocode(names, workers=10):
         try:
             lat, lon = fut.result()
         except Exception:
-            lat, lon = (None, None)
+            lat, lon = None, None
         results.append((name, lat, lon))
     return results
 
-# Main route: start or check job
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    job_id = request.args.get('job')
+    results = None
+    token = None
     if request.method == 'POST':
-        # Parse names from file or text
+        # Determine list of names
         names = []
         f = request.files.get('file')
         if f and f.filename:
@@ -147,44 +164,27 @@ def index():
             text = request.form.get('text_input', '')
             names = split_names(text)
         if names:
-            # Create job
-            job_id = str(uuid.uuid4())
-            jobs[job_id] = {'status': 'pending', 'results': None, 'csv': None}
-            # Background thread
-            def run(jid, name_list):
-                res = batch_geocode(name_list)
-                buf = io.StringIO()
-                buf.write('institute,latitude,longitude\n')
-                for inst, lat, lon in res:
-                    buf.write(f"{inst},{lat or ''},{lon or ''}\n")
-                jobs[jid]['results'] = res
-                jobs[jid]['csv'] = buf.getvalue()
-                jobs[jid]['status'] = 'done'
-            Thread(target=run, args=(job_id, names), daemon=True).start()
-            # Show status
-            return render_template_string(TEMPLATE, job_id=job_id, pending=True)
-    # If checking existing job
-    if job_id:
-        job = jobs.get(job_id)
-        if job:
-            if job['status'] == 'done':
-                return render_template_string(TEMPLATE, job_id=job_id, results=job['results'])
-            else:
-                return render_template_string(TEMPLATE, job_id=job_id, pending=True)
-    # Initial page
-    return render_template_string(TEMPLATE)
+            results = batch_geocode(names)
+            # Prepare CSV download
+            # Prepare CSV
+            buf = io.StringIO()
+            buf.write('institute,latitude,longitude\n')
+            for inst, lat, lon in results:
+                buf.write(f"{inst},{lat or ''},{lon or ''}\n")
+            buf.seek(0)
+            token = 'tmp'
+            app.config[token] = buf.getvalue()
+    return render_template_string(TEMPLATE, results=results, token=token)
 
-# Download endpoint
-@app.route('/download/<job_id>')
-def download(job_id):
-    job = jobs.get(job_id)
-    if not job or job['status'] != 'done':
-        return 'Not found or pending', 404
-    data = job['csv']
-    return send_file(
+@app.route('/download/<token>')
+def download(token):
+    data = app.config.get(token)
+    if not data:
+        return 'Not found', 404
+    return send_file(More actions
         io.BytesIO(data.encode('utf-8')),
         as_attachment=True,
-        download_name=f'geocoded_{job_id}.csv',
+        download_name='geocoded.csv',
         mimetype='text/csv'
     )
 
