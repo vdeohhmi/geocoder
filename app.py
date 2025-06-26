@@ -6,11 +6,11 @@ import time
 import re
 from flask import Flask, request, render_template_string, send_file
 import pandas as pd
-from geopy.geocoders import GoogleV3
-from geopy.exc import GeocoderTimedOut, GeocoderQuotaExceeded
+from geopy.geocoders import ArcGIS
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# HTML template with batch upload and free-text geocoding
+# HTML template for batch upload and free-text geocoding
 TEMPLATE = """<!doctype html>
 <html>
 <head>
@@ -20,7 +20,7 @@ TEMPLATE = """<!doctype html>
 </head>
 <body class=\"p-4\">
   <h1>Institute Geocoder</h1>
-  <p class=\"text-muted\">Powered by Google Geocoding API</p>
+  <p class=\"text-muted\">Powered by ArcGIS Public Geocoder (no API key required)</p>
 
   <h2>Batch Upload</h2>
   <form method=\"post\" enctype=\"multipart/form-data\" class=\"mb-4\">
@@ -54,49 +54,40 @@ TEMPLATE = """<!doctype html>
 </html>
 """
 
-# Concurrency settings
-tasks = int(os.getenv('MAX_WORKERS', '10'))
+# Concurrency & throttle settings
+MAX_WORKERS = int(os.getenv('MAX_WORKERS', '5'))
+DELAY = float(os.getenv('DELAY', '0.2'))
 
-# Initialize Flask app and Google geocoder
-API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
-if not API_KEY:
-    raise RuntimeError('Please set GOOGLE_MAPS_API_KEY environment variable')
-
-geo = GoogleV3(api_key=API_KEY, timeout=10)
+# Initialize Flask app and ArcGIS geocoder
 app = Flask(__name__)
+geolocator = ArcGIS(timeout=10)
 
-# Geocode helper with retries
-async def geocode_name(name, retries=2):
-    try:
-        return geo.geocode(name)
-    except GeocoderQuotaExceeded:
-        return None
-    except GeocoderTimedOut:
-        if retries > 0:
+# Single geocode with retries and error handling
+def geocode_name(name, retries=2):
+    for _ in range(retries + 1):
+        try:
+            loc = geolocator.geocode(name)
+            if loc:
+                return loc.latitude, loc.longitude
+        except (GeocoderTimedOut, GeocoderServiceError):
             time.sleep(1)
-            return geocode_name(name, retries-1)
-        return None
+    return None, None
 
 # Batch geocode using ThreadPoolExecutor
-from functools import partial
-
 def batch_geocode(names):
-    results = []
-    with ThreadPoolExecutor(max_workers=tasks) as executor:
-        futures = {executor.submit(geocode_name, n): n for n in names}
-        for future in as_completed(futures):
-            name = futures[future]
+    coords = [None] * len(names)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_idx = {executor.submit(geocode_name, n): i for i, n in enumerate(names)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
             try:
-                loc = future.result()
-                if loc:
-                    results.append((loc.latitude, loc.longitude))
-                else:
-                    results.append((None, None))
+                coords[idx] = future.result()
             except Exception:
-                results.append((None, None))
-    return results
+                coords[idx] = (None, None)
+            time.sleep(DELAY)
+    return coords
 
-@app.route('/', methods=['GET','POST'])
+@app.route('/', methods=['GET', 'POST'])
 def index():
     error = None
     preview = None
@@ -104,14 +95,15 @@ def index():
 
     if request.method == 'POST':
         action = request.form.get('action')
-
+        # File upload geocoding
         if action == 'geocode_file' and 'file' in request.files:
             f = request.files['file']
             if not f.filename:
                 error = 'No file selected.'
             else:
                 try:
-                    df = pd.read_excel(f) if f.filename.lower().endswith(('.xls','.xlsx')) else pd.read_csv(f)
+                    df = (pd.read_excel(f) if f.filename.lower().endswith(('.xls', '.xlsx'))
+                          else pd.read_csv(f))
                 except Exception as e:
                     error = f'Error reading file: {e}'
                     df = None
@@ -119,30 +111,31 @@ def index():
                     if 'institute' not in df.columns:
                         error = "Missing 'institute' column."
                     else:
-                        coords = batch_geocode(df['institute'].astype(str).tolist())
-                        df[['latitude','longitude']] = pd.DataFrame(coords)
+                        names = df['institute'].astype(str).tolist()
+                        coords = batch_geocode(names)
+                        df[['latitude', 'longitude']] = pd.DataFrame(coords)
                         buf = io.BytesIO()
                         base = os.path.splitext(f.filename)[0]
-                        if f.filename.lower().endswith(('.xls','.xlsx')):
+                        if f.filename.lower().endswith(('.xls', '.xlsx')):
                             df.to_excel(buf, index=False)
                             mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                             fname = f'{base}_geocoded.xlsx'
                         else:
-                            buf.write(df.to_csv(index=False).encode())
+                            buf.write(df.to_csv(index=False).encode('utf-8'))
                             mimetype = 'text/csv'
                             fname = f'{base}_geocoded.csv'
                         buf.seek(0)
-                        token = base + '_token'
+                        token = f'{base}_token'
                         app.config[token] = (buf, fname, mimetype)
                         preview = df.head().to_html(classes='table table-striped', index=False)
                         download_url = f'/download/{token}'
-
+        # Free text geocoding
         elif action == 'geocode_text':
             text = request.form.get('text_input', '')
             if not text.strip():
                 error = 'No text provided.'
             else:
-                names = [n.strip() for n in re.split(r'[\r\n,]+', text) if n.strip()]
+                names = [p.strip() for p in re.split(r'[\r\n,]+', text) if p.strip()]
                 coords = batch_geocode(names)
                 df = pd.DataFrame({'institute': names,
                                    'latitude': [c[0] for c in coords],
@@ -161,5 +154,5 @@ def download(token):
     return send_file(buf, as_attachment=True, download_name=fname, mimetype=mimetype)
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 8000))
+    port = int(os.getenv('PORT', '8000'))
     app.run(host='0.0.0.0', port=port)
