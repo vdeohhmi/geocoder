@@ -6,23 +6,17 @@ import time
 import re
 from flask import Flask, request, render_template_string, send_file
 import pandas as pd
-import requests
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 from geopy.geocoders import ArcGIS, Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Initialize Flask app
-# Initialize Flask
 app = Flask(__name__)
 
-# HTML template: file upload or text input, results table, download link
 # Configure geocoders
 arcgis = ArcGIS(timeout=10)
 osm = Nominatim(user_agent="InstituteGeocoder/1.0")
 
-# HTML template
+# HTML template with upload/text, inline results, and download link
 TEMPLATE = '''<!doctype html>
 <html>
 <head>
@@ -34,11 +28,10 @@ TEMPLATE = '''<!doctype html>
   <h1>Institute Geocoder</h1>
   <form method="post" enctype="multipart/form-data">
     <div class="mb-3">
-      <label class="form-label">Upload CSV/XLSX with <code>institute</code> column:</label>
+      <label class="form-label">CSV/XLSX with <code>institute</code> column:</label>
       <input type="file" name="file" accept=".csv,.xls,.xlsx" class="form-control">
     </div>
     <div class="mb-3">
-      <label class="form-label">Or paste institutes (newline or comma-separated):</label>
       <label class="form-label">Or paste institutes (one per line or comma-separated):</label>
       <textarea name="text_input" rows="4" class="form-control"></textarea>
     </div>
@@ -48,16 +41,16 @@ TEMPLATE = '''<!doctype html>
   {% if results %}
     <h2 class="mt-4">Results</h2>
     <div class="table-responsive">
-      <table class="table table-bordered table-striped">
+      <table class="table table-bordered">
         <thead><tr><th>Institute</th><th>Latitude</th><th>Longitude</th></tr></thead>
         <tbody>
-        {% for inst, lat, lon in results %}
-          <tr>
-            <td>{{ inst }}</td>
-            <td>{{ '%.6f'|format(lat) if lat is not none else '' }}</td>
-            <td>{{ '%.6f'|format(lon) if lon is not none else '' }}</td>
-          </tr>
-        {% endfor %}
+          {% for inst, lat, lon in results %}
+            <tr>
+              <td>{{ inst }}</td>
+              <td>{{ '%.6f'|format(lat) if lat is not none else '' }}</td>
+              <td>{{ '%.6f'|format(lon) if lon is not none else '' }}</td>
+            </tr>
+          {% endfor %}
         </tbody>
       </table>
     </div>
@@ -66,82 +59,58 @@ TEMPLATE = '''<!doctype html>
 </body>
 </html>'''
 
-# Initialize geocoder
-osm = Nominatim(user_agent="InstituteGeocoder/1.0")
+# Geocode a single name using ArcGIS first, then Nominatim fallback
 
-# Geocode helper: try Census API first, then Nominatim
-# Geocode helper: ArcGIS first, then Nominatim
-
-def geocode_address(name):
-    # Census API
-    # Try ArcGIS (POI and address support)
+def geocode_name(name):
     try:
-        resp = requests.get(
-            'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress',
-            params={'address': f"{name}, USA", 'benchmark': 'Public_AR_Current', 'format': 'json'},
-            timeout=5
-        )
-        data = resp.json()
-        matches = data.get('result', {}).get('addressMatches', [])
-        if matches:
-            coord = matches[0]['coordinates']
-            return coord['y'], coord['x']
-    except Exception:
         loc = arcgis.geocode(name, exactly_one=True)
         if loc:
             return loc.latitude, loc.longitude
     except GeocoderServiceError:
         pass
-    # Nominatim fallback
-    # Fallback to Nominatim
     for _ in range(2):
         try:
-            loc = osm.geocode(f"{name}, USA", timeout=10)
             loc = osm.geocode(name, exactly_one=True)
             if loc:
                 return loc.latitude, loc.longitude
-            # try bias to USA
             loc = osm.geocode(f"{name}, USA", exactly_one=True)
             if loc:
                 return loc.latitude, loc.longitude
-        except (GeocoderTimedOut, GeocoderUnavailable):
-        except GeocoderTimedOut:
+        except (GeocoderTimedOut, GeocoderServiceError):
             time.sleep(1)
     return None, None
 
-# Split text input into institute names
-# Split text input into names
+# Split text preserving parentheses
 
 def split_names(text):
-    parts = re.split(r'[\r\n,]+', text)
-    return [p.strip() for p in parts if p.strip()]
+    names = []
+    for line in text.splitlines():
+        buf, depth = '', 0
+        for ch in line:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth = max(depth-1, 0)
+            if ch == ',' and depth == 0:
+                if buf.strip(): names.append(buf.strip())
+                buf = ''
+            else:
+                buf += ch
+        if buf.strip(): names.append(buf.strip())
+    return names
 
-# Batch geocode with ThreadPoolExecutor
-# Batch geocode with concurrency, preserving input order
+# Batch geocode concurrently, preserve input order
 
-def batch_geocode(names, max_workers=10):
-    results = []
+def batch_geocode(names, workers=10):
     futures = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(geocode_address, name): name for name in names}
-        for future in as_completed(future_map):
-            name = future_map[future]
-            try:
-                lat, lon = future.result()
-            except Exception:
-                lat, lon = (None, None)
-            results.append((name, lat, lon))
-    # preserve input order
-    # results currently in completion order; reorder
-    name_to_coord = {r[0]: (r[1], r[2]) for r in results}
-    return [(n, *(name_to_coord[n])) for n in names]
-        for name in names:
-            futures.append((name, executor.submit(geocode_address, name)))
+    with ThreadPoolExecutor(max_workers=workers) as exe:
+        for n in names:
+            futures.append((n, exe.submit(geocode_name, n)))
     results = []
     for name, fut in futures:
         try:
             lat, lon = fut.result()
-        except Exception:
+        except:
             lat, lon = None, None
         results.append((name, lat, lon))
     return results
@@ -151,28 +120,25 @@ def index():
     results = None
     token = None
     if request.method == 'POST':
-        # Determine list of names
         names = []
         f = request.files.get('file')
         if f and f.filename:
             try:
                 df = pd.read_excel(f) if f.filename.lower().endswith(('.xls', '.xlsx')) else pd.read_csv(f)
                 names = df['institute'].astype(str).tolist()
-            except Exception:
+            except:
                 names = []
         if not names:
             text = request.form.get('text_input', '')
             names = split_names(text)
         if names:
             results = batch_geocode(names)
-            # Prepare CSV download
-            # Prepare CSV
             buf = io.StringIO()
             buf.write('institute,latitude,longitude\n')
             for inst, lat, lon in results:
                 buf.write(f"{inst},{lat or ''},{lon or ''}\n")
             buf.seek(0)
-            token = 'tmp'
+            token = 'r'
             app.config[token] = buf.getvalue()
     return render_template_string(TEMPLATE, results=results, token=token)
 
@@ -181,8 +147,8 @@ def download(token):
     data = app.config.get(token)
     if not data:
         return 'Not found', 404
-    return send_file(More actions
-        io.BytesIO(data.encode('utf-8')),
+    return send_file(
+        io.BytesIO(data.encode()),
         as_attachment=True,
         download_name='geocoded.csv',
         mimetype='text/csv'
