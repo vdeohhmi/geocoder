@@ -123,15 +123,3 @@ def download(token):
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8000)))
-
-# requirements.txt
-# ----------------
-Flask==2.3.2
-geopy==2.4.1
-pandas>=2.0
-openpyxl
-gunicorn==20.1.0
-
-# Procfile
-# --------
-web: gunicorn app:app --timeout 300 --workers 2
